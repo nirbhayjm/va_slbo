@@ -6,7 +6,7 @@ from lunzi import Tensor
 from slbo.utils.normalizer import Normalizers
 
 
-class MultiStepLoss(nn.Module):
+class MLELoss(nn.Module):
     op_train: Tensor
     op_grad_norm: Tensor
     _step: int
@@ -37,7 +37,7 @@ class MultiStepLoss(nn.Module):
                 tf.float32, shape=[step, None, dim_state]
             )
 
-        self.op_loss, self.op_va_loss = self(
+        self.op_loss, self.op_ma_loss = self(
             self.op_states,
             self.op_actions,
             self.op_next_states_,
@@ -53,24 +53,15 @@ class MultiStepLoss(nn.Module):
         rewards: Tensor,
         masks: Tensor,
     ):
-        """
-            All inputs have shape [num_steps, batch_size, xxx]
-        """
+        if len(states.shape) == 3:
+            states = states.reshape((-1, states.shape[2]))
+            actions = actions.reshape((-1, actions.shape[2]))
+            next_states_ = next_states_.reshape((-1, next_states_.shape[2]))
 
-        cur_states = states[0]
-        loss = []
-        for i in range(self._step):
-            next_states = self._model(cur_states, actions[i])
-            diffs = next_states - cur_states - next_states_[i] + states[i]
-            weighted_diffs = diffs / self._normalizers.diff.op_std.maximum(1e-6)
-            loss.append(self._criterion(weighted_diffs, 0, cur_states))
-
-            if i < self._step - 1:
-                cur_states = states[i + 1] + masks[i].expand_dims(-1) * (
-                    next_states - states[i + 1]
-                )
-
-        loss = tf.add_n(loss) / self._step
+        cur_states = states
+        ns_diffs = self._model(cur_states, actions)
+        pred_ns = cur_states + ns_diffs
+        loss = self._criterion(pred_ns, next_states_)
         va_loss = loss * 0
         return loss, va_loss
 

@@ -1,26 +1,33 @@
-# Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved.
 import lunzi.nn as nn
 import numpy as np
 import tensorflow as tf
 from lunzi import Tensor
+from slbo.policies import BasePolicy
 from slbo.utils.normalizer import Normalizers
+from slbo.utils.runner import Runner
 
 
-class MultiStepLoss(nn.Module):
+class ValueAwareLoss(nn.Module):
     op_train: Tensor
     op_grad_norm: Tensor
+    _value_function: nn.Module
     _step: int
     _criterion: nn.Module
     _normalizers: Normalizers
     _model: nn.Module
+    _va_norm: str
 
     def __init__(
         self,
         model: nn.Module,
+        value_function: nn.Module,
         normalizers: Normalizers,
         dim_state: int,
         dim_action: int,
         criterion: nn.Module,
+        va_loss_coeff: float,
+        va_norm: str = "l1",
+        virt_runner: Runner = None,
         step=4,
     ):
         super().__init__()
@@ -28,6 +35,12 @@ class MultiStepLoss(nn.Module):
         self._criterion = criterion
         self._model = model
         self._normalizers = normalizers
+
+        self._value_function = value_function
+        self._va_norm = va_norm
+        self._virt_runner = virt_runner
+        self._va_loss_coeff = va_loss_coeff
+
         with self.scope:
             self.op_states = tf.placeholder(tf.float32, shape=[step, None, dim_state])
             self.op_actions = tf.placeholder(tf.float32, shape=[step, None, dim_action])
@@ -37,13 +50,27 @@ class MultiStepLoss(nn.Module):
                 tf.float32, shape=[step, None, dim_state]
             )
 
-        self.op_loss, self.op_va_loss = self(
+        (
+            self.op_loss,
+            self.op_va_loss,
+        ) = self(
             self.op_states,
             self.op_actions,
             self.op_next_states_,
             self.op_rewards,
             self.op_masks,
         )
+        self.op_value_pred = self.value_forward(self.op_states, self.op_masks)
+
+    @nn.make_method(fetch="value_pred")
+    def get_value(self, states, masks):
+        pass
+
+    def value_forward(self, states: Tensor, masks: Tensor):
+        states = states.reshape((-1, states.shape[2]))
+        v_pred = self._value_function(states)
+        v_pred = v_pred.reshape((self._step, -1))
+        return v_pred
 
     def forward(
         self,
@@ -53,25 +80,33 @@ class MultiStepLoss(nn.Module):
         rewards: Tensor,
         masks: Tensor,
     ):
-        """
-            All inputs have shape [num_steps, batch_size, xxx]
-        """
+        states = states.reshape((-1, states.shape[2]))
+        actions = actions.reshape((-1, actions.shape[2]))
+        next_states_ = next_states_.reshape((-1, next_states_.shape[2]))
+        lhs_ns_value = self._value_function(next_states_)
 
-        cur_states = states[0]
-        loss = []
-        for i in range(self._step):
-            next_states = self._model(cur_states, actions[i])
-            diffs = next_states - cur_states - next_states_[i] + states[i]
-            weighted_diffs = diffs / self._normalizers.diff.op_std.maximum(1e-6)
-            loss.append(self._criterion(weighted_diffs, 0, cur_states))
+        ns_sample = self._model(states, actions)
+        rhs_ns_value = self._value_function(ns_sample)
 
-            if i < self._step - 1:
-                cur_states = states[i + 1] + masks[i].expand_dims(-1) * (
-                    next_states - states[i + 1]
-                )
+        model_advantage = lhs_ns_value - rhs_ns_value
+        # Shape (B,)
 
-        loss = tf.add_n(loss) / self._step
-        va_loss = loss * 0
+        if self._va_norm == "l2":
+            va_loss_batch = model_advantage ** 2
+        elif self._va_norm == "l1":
+            va_loss_batch = tf.abs(model_advantage)
+        else:
+            raise ValueError(f"{self._va_norm}")
+
+        va_loss_batch = (
+            tf.reduce_sum(va_loss_batch.reshape((self._step, -1)), 0) / self._step
+        )
+        # Shape (B,)
+
+        va_loss = tf.reduce_mean(va_loss_batch, axis=0)
+        slbo_add_loss = va_loss * 0
+        loss = self._va_loss_coeff * va_loss
+
         return loss, va_loss
 
     @nn.make_method(fetch="loss")

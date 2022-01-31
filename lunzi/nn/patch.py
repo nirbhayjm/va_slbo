@@ -56,5 +56,4 @@ def monkey_patch(avoid_set=None):
         setattr(tf.Tensor, key, value)
         setattr(tf.Variable, key, value)
 
-
 monkey_patch()

@@ -4,4 +4,3 @@ pyopengl
 joblib
 mako
 mujoco_py
-
